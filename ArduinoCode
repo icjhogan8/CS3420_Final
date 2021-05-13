@@ -1,0 +1,257 @@
+#define LOG_OUT 1 // use the log output function
+#define FFT_N 256 // set to 256 point fft
+#include <FFT.h> // include the library 
+
+//variables updated by ISR for fft
+volatile int counter = 0;
+volatile int adcVal[257];
+
+//constant for checker fft bins
+int checker;
+
+//original values
+int CTRLA;
+int CTRLC;
+int MUXPOS;
+int INTCTRL;
+
+//Ultrasound constants
+const int triggerPIN = 10;
+const int echoPIN = 7;
+float soundDuration;
+float prevSoundDuration; 
+float distToObjectInCM; 
+ 
+//Time constants
+unsigned long previousMicros = 0; 
+long OnTime = 10; //microseconds of on-time
+long OffTime = 2; //microseconds of off-time
+unsigned long previousMillis = 0;
+int triggerState = LOW;
+int currentMillis;
+int initMillis;
+
+//H bridge pins
+int enA = 6;
+int in1 = 9;
+int in2 = 8;
+
+int enB = 3;
+int in3 = 4;
+int in4 = 5;
+
+//saved speeds
+int motorSpeedMedForwardA = 120;
+int motorSpeedMedForwardB = 110;
+
+int ledPin = LED_BUILTIN;
+int ledState = LOW;
+
+//saved fft outputs
+unsigned char currentFFT[128];
+unsigned char previousFFT[128];
+
+void setup() {
+  //set all pins in I/O
+  pinMode(triggerPIN, OUTPUT);
+  pinMode(echoPIN, INPUT);
+  Serial.begin(115200);
+
+  pinMode(enA, OUTPUT);
+  pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+
+  pinMode(ledPin, OUTPUT);
+
+  //save original registers
+  CTRLA = ADC0.CTRLA;
+  CTRLC = ADC0.CTRLC;
+  MUXPOS = ADC0.MUXPOS;
+  INTCTRL = TCA0.SINGLE.INTCTRL;
+  
+  /* Disable digital input buffer */
+  PORTA.PIN2CTRL &= ~PORT_ISC_gm;
+  PORTA.PIN2CTRL |= PORT_ISC_INPUT_DISABLE_gc;
+
+  /* Disable pull-up resistor */
+  PORTA.PIN2CTRL &= ~PORT_PULLUPEN_bm;
+
+  ADC0.CTRLC = ADC_PRESC_DIV16_gc /* CLK_PER divided by 4 */
+  | ADC_REFSEL_VDDREF_gc; /* Internal reference */
+
+  ADC0.CTRLA = ADC_ENABLE_bm /* ADC Enable: enabled */
+  | ADC_RESSEL_10BIT_gc; /* 10-bit mode */
+
+  /* Select ADC channel */
+  ADC0.MUXPOS = ADC_MUXPOS_AIN2_gc;
+
+  /* Enable FreeRun mode */
+  ADC0.CTRLA |= ADC_FREERUN_bm;
+
+  /* Start conversion */
+  ADC0.COMMAND = ADC_STCONV_bm;
+
+  TCA0.SINGLE.INTCTRL = TCA_SINGLE_OVF_bm;
+
+  TCA0.SINGLE.PER = 0x67;
+
+  /* Set the prescaler to 256, & start the counter
+  */
+  /* TCA_SINGLE_CLKSEL_DIV256_gc = (0x06<<1),  /* System Clock / 64*/
+  TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV64_gc /* set clock source (sys_clk/256) */
+                      /* TCA_SINGLE_ENABLE_bm  0x01  /* Module Enable bit mask.  */
+                      | TCA_SINGLE_ENABLE_bm; /* start timer */
+
+  TCA0.SINGLE.EVCTRL &= ~(TCA_SINGLE_CNTEI_bm);
+                   
+  TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_NORMAL_gc;
+  
+  /* enable global interrupts */
+  sei();
+}
+ 
+void loop() {
+  //Once there are 257 bins begin fft analysis
+  if (counter >= 257) {
+    //reset counter
+    counter = 0;
+
+    //run fft on collected data
+    collect_fft();
+
+    //obtiain current and save
+    for (int i = 0; i<128; i++) {
+      currentFFT[i] = fft_log_out[i];     
+    }
+    
+    //check bins 50-65 for a large amplitude
+    for (int i = 50; i <= 60; i++){
+      //check for 60+ amplitude peaks in the 550Hz range for two sample
+      //used to verify that there is a pulse and not just noise 
+      if (currentFFT[i] > 60 && previousFFT[i] > 60){
+        checker = 1;
+      }
+    }
+
+    //save for comparison to last fft
+    for (int i = 0;  i<128; i++) {
+      previousFFT[i] = currentFFT[i];     
+    }
+
+    //save time prior to while loop
+    initMillis = millis();
+    
+    //if there are multiple 550HZ readings enter spinning until 5 seconds occurs
+    while((checker == 1) && (millis() - initMillis < 5000)){
+      clockwise();
+
+      //if detected object turn led on
+      if ((collect_US() > 13 && collect_US() < 27 ) || (collect_US() > 53 && collect_US() < 67) ){
+        digitalWrite(ledPin, HIGH);
+      }
+
+      //else turn off the led
+      else {
+        digitalWrite(ledPin, LOW);
+      }
+    }
+
+    //reset to original state
+    if ((checker == 1) && (millis() - initMillis >= 4770)) {
+      checker = 0;
+      fullstop();
+    }
+    
+    //else reset interrupts and keep probing for 550HZ
+    interrupt_reset();
+  }
+}
+
+//read from ADC
+int ADC0_read() {
+  /* Clear the interrupt flag by writing 1: */
+ ADC0.INTFLAGS = ADC_RESRDY_bm;
+
+ return ADC0.RES;
+}
+
+//ISR for collected fft data
+ISR(TCA0_OVF_vect) {
+  
+  if (counter < 257) {
+    adcVal[counter] = ADC0_read();
+    counter ++;
+  }
+
+  TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm;
+}
+
+void collect_fft() {
+    //turn off TCA interrupts
+    TCA0.SINGLE.INTCTRL = 0;
+   
+    ADC0.CTRLC = CTRLC;
+    ADC0.CTRLA = CTRLA;
+    ADC0.MUXPOS = MUXPOS;
+
+    //sign and shift adcVal
+    for (int i=1; i<257; i++){
+      adcVal[i] -= 512;
+      adcVal[i] = adcVal[i] << 6;
+    }
+
+    //add even and odd bins accordingly
+    int y = 1;
+    int i = 0;
+    while (i <  512) {
+      fft_input[i] = adcVal[y];
+      i ++;
+      fft_input[i] = 0;
+      i ++;
+      y ++;
+    }
+
+    // fft setup
+    fft_window();
+    fft_reorder();
+    fft_run();
+    fft_mag_log();
+}
+
+void interrupt_reset(){
+    /* Select ADC channel */
+  ADC0.MUXPOS = ADC_MUXPOS_AIN2_gc;
+
+  /* Enable FreeRun mode */
+  ADC0.CTRLA |= ADC_FREERUN_bm;
+
+  /* Start conversion */
+  ADC0.COMMAND = ADC_STCONV_bm;
+  
+  TCA0.SINGLE.INTCTRL = TCA_SINGLE_OVF_bm;
+
+  /* set the period
+    This is the number of clock ticks between when the timer starts
+    and the when the first interrupt is triggered, and also the number of clock ticks
+    between two consecutive interrupts.
+  */
+  TCA0.SINGLE.PER = 0x67;
+
+  /* Set the prescaler to 256, & start the counter
+  */
+  /* TCA_SINGLE_CLKSEL_DIV256_gc = (0x06<<1),  /* System Clock / 256 */
+  TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV64_gc /* set clock source (sys_clk/256) */
+                      /* TCA_SINGLE_ENABLE_bm  0x01  /* Module Enable bit mask.  */
+                      | TCA_SINGLE_ENABLE_bm; /* start timer */
+
+  TCA0.SINGLE.EVCTRL &= ~(TCA_SINGLE_CNTEI_bm);                 
+  TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_NORMAL_gc;
+}
